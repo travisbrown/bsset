@@ -1,0 +1,17 @@
+[package]
+name = "bsset"
+authors = ["Travis Brown <travisrobertbrown@gmail.com>"]
+repository = "https://github.com/travisbrown/bsset"
+description = "Byte-string set with a fixed key length, prefix-based membership, and mmap-backed storage"
+edition = "2024"
+license = "AGPL-3.0-only"
+readme = "README.md"
+version = "0.1.0"
+
+[dependencies]
+memmap2 = "0.9"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
