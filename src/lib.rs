@@ -1,3 +1,4 @@
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, rust_2018_idioms)]
 //! A byte-string set for fixed-length keys with prefix-based membership.
 //!
 //! Keys have a type-level length `N`. Each set also has a runtime prefix length (called `P` here).
@@ -116,10 +117,10 @@ enum Storage {
 impl Storage {
     fn as_slice(&self) -> &[u8] {
         match self {
-            Storage::Owned(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
             // Mapped files start with the header; `read` has already checked the map is at least
             // `HEADER_LEN` bytes long.
-            Storage::Mapped(map) => &map[HEADER_LEN..],
+            Self::Mapped(map) => &map[HEADER_LEN..],
         }
     }
 }
@@ -314,6 +315,7 @@ pub struct ByteStringSet<const N: usize> {
 
 impl<const N: usize> ByteStringSet<N> {
     /// Create an empty [`ByteStringSetBuilder`] for assembling a set from `[u8; N]` keys.
+    #[must_use]
     pub fn builder() -> ByteStringSetBuilder<N> {
         ByteStringSetBuilder::default()
     }
@@ -345,28 +347,32 @@ impl<const N: usize> ByteStringSet<N> {
         // SAFETY: mapping a file is only unsound if another process truncates or rewrites it
         // while mapped; callers must uphold the immutability requirement documented above.
         let map = unsafe { Mmap::map(&file)? };
-        let Some(header) = map.get(..HEADER_LEN) else {
+        // `split_first_chunk` returns the leading bytes as a fixed-size `&[u8; HEADER_LEN]`
+        // array (plus the rest of the map), or `None` if the map is too short.
+        let Some((header, data)) = map.split_first_chunk::<HEADER_LEN>() else {
             return Err(Error::BadHeader);
         };
+        // `prefix_len_bytes @ ..` binds the trailing 8 bytes as a `[u8; 8]`.
+        let &[
+            magic0,
+            magic1,
+            magic2,
+            magic3,
+            version,
+            _,
+            _,
+            _,
+            prefix_len_bytes @ ..,
+        ] = header;
 
-        if header[..4] != MAGIC {
+        if [magic0, magic1, magic2, magic3] != MAGIC {
             Err(Error::BadHeader)
-        } else if header[4] != FORMAT_VERSION {
-            Err(Error::UnsupportedVersion { version: header[4] })
+        } else if version != FORMAT_VERSION {
+            Err(Error::UnsupportedVersion { version })
         } else {
-            let raw_prefix_len = u64::from_le_bytes(
-                header[8..16]
-                    .try_into()
-                    .expect("header slice is exactly 8 bytes"),
-            );
+            let raw_prefix_len = u64::from_le_bytes(prefix_len_bytes);
             let prefix_len = usize::try_from(raw_prefix_len).map_err(|_| Error::BadHeader)?;
-            if !(OFFSET_TABLE_PREFIX_LEN..=N).contains(&prefix_len) {
-                Err(Error::InvalidPrefixLen {
-                    prefix_len,
-                    key_len: N,
-                })
-            } else {
-                let data = &map[HEADER_LEN..];
+            if (OFFSET_TABLE_PREFIX_LEN..=N).contains(&prefix_len) {
                 if data.len() % prefix_len != 0 {
                     Err(Error::Misaligned {
                         data_len: data.len(),
@@ -380,6 +386,11 @@ impl<const N: usize> ByteStringSet<N> {
                         offsets,
                     })
                 }
+            } else {
+                Err(Error::InvalidPrefixLen {
+                    prefix_len,
+                    key_len: N,
+                })
             }
         }
     }
@@ -396,6 +407,7 @@ impl<const N: usize> ByteStringSet<N> {
     /// # Returns
     ///
     /// `true` if the key's `P`-byte prefix is present.
+    #[must_use]
     pub fn lookup(&self, key: [u8; N]) -> bool {
         let probe = &key[..self.prefix_len];
         let data = self.data.as_slice();
@@ -416,17 +428,20 @@ impl<const N: usize> ByteStringSet<N> {
     }
 
     /// Number of distinct `P`-byte prefixes stored.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data.as_slice().len() / self.prefix_len
     }
 
     /// Whether the set contains no entries.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.as_slice().is_empty()
     }
 
     /// The prefix length `P` this set matches on.
-    pub fn prefix_len(&self) -> usize {
+    #[must_use]
+    pub const fn prefix_len(&self) -> usize {
         self.prefix_len
     }
 

@@ -98,21 +98,19 @@ impl<const N: usize> ExternalBuild<N> {
         for _ in 0..size / N as u64 {
             reader.read_exact(&mut key)?;
             let slot = &mut buckets[key[depth] as usize];
-            let bucket = match slot {
-                Some(bucket) => bucket,
-                // `Option::insert` stores the value and returns a mutable reference to it.
-                None => {
-                    let path = self
-                        .partition_dir
-                        .path()
-                        .join(self.next_file_id.to_string());
-                    self.next_file_id += 1;
-                    slot.insert(Partition {
-                        writer: BufWriter::new(File::create(&path)?),
-                        path,
-                        bytes: 0,
-                    })
-                }
+            let bucket = if let Some(bucket) = slot {
+                bucket
+            } else {
+                let path = self
+                    .partition_dir
+                    .path()
+                    .join(self.next_file_id.to_string());
+                self.next_file_id += 1;
+                slot.insert(Partition {
+                    writer: BufWriter::new(File::create(&path)?),
+                    path,
+                    bytes: 0,
+                })
             };
             bucket.writer.write_all(&key)?;
             bucket.bytes += N as u64;
@@ -132,7 +130,7 @@ impl<const N: usize> ExternalBuild<N> {
 
 /// Insert-time state of an external-sort builder: keys stream to an anonymous spill file.
 #[derive(Debug)]
-pub(crate) struct SpillState {
+pub struct SpillState {
     writer: BufWriter<File>,
     max_bucket_bytes: usize,
 }
