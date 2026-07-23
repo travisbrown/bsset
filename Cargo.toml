@@ -10,8 +10,8 @@ version = "0.1.0"
 
 [dependencies]
 memmap2 = "0.9"
+tempfile = "3"
 thiserror = "2"
 
 [dev-dependencies]
 proptest = "1"
-tempfile = "3"

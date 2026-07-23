@@ -15,14 +15,18 @@
 //! A lookup is one table read plus a binary search inside a single bucket. The table costs a
 //! fixed 64 MiB per set, which pays off for large sets.
 //!
+//! Building normally buffers all keys in memory. For sets that do not fit,
+//! [`ByteStringSetBuilder::with_max_bucket_bytes`] spills keys to temporary files and builds the
+//! set with an external most-significant-byte radix sort instead.
+//!
 //! # Examples
 //!
 //! ```
 //! use bsset::ByteStringSet;
 //!
 //! let mut builder = ByteStringSet::<4>::builder();
-//! builder.insert(*b"abcd");
-//! builder.insert(*b"wxyz");
+//! builder.insert(*b"abcd")?;
+//! builder.insert(*b"wxyz")?;
 //!
 //! // Prefix length 4 == key length 4, so lookups are exact.
 //! let set = builder.build(4)?;
@@ -37,6 +41,8 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use thiserror::Error;
+
+mod external;
 
 /// Number of bytes consumed by the first-level offset table.
 const OFFSET_TABLE_PREFIX_LEN: usize = 3;
@@ -158,25 +164,109 @@ fn build_offsets(data: &[u8], prefix_len: usize) -> Result<Vec<u32>, Error> {
     }
 }
 
+/// Write the data file header (magic, format version, and prefix length) to `out`.
+fn write_header(out: &mut impl Write, prefix_len: usize) -> io::Result<()> {
+    let mut header = [0u8; HEADER_LEN];
+    header[..4].copy_from_slice(&MAGIC);
+    header[4] = FORMAT_VERSION;
+    header[8..16].copy_from_slice(&(prefix_len as u64).to_le_bytes());
+    out.write_all(&header)
+}
+
+/// Sort `keys`, drop all but the first key of each distinct `prefix_len`-byte prefix, and write
+/// the surviving prefixes to `out` in order.
+fn sort_dedup_emit<const N: usize>(
+    keys: &mut Vec<[u8; N]>,
+    prefix_len: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    // Lexicographic sort of the full keys also sorts their prefixes, so keys sharing a prefix
+    // end up adjacent for `dedup_by` below.
+    keys.sort_unstable();
+    // `dedup_by` drops an element when the closure says it matches the element kept immediately
+    // before it — here, same first `prefix_len` bytes.
+    keys.dedup_by(|next, kept| next[..prefix_len] == kept[..prefix_len]);
+    for key in keys.iter() {
+        out.write_all(&key[..prefix_len])?;
+    }
+    Ok(())
+}
+
 /// Accumulates `[u8; N]` keys and builds a [`ByteStringSet`].
 ///
-/// Obtained from [`ByteStringSet::builder`]. Duplicate insertions are fine; they are removed
-/// during [`build`].
+/// Obtained from [`ByteStringSet::builder`] (in-memory) or
+/// [`ByteStringSetBuilder::with_max_bucket_bytes`] (external sort). Duplicate insertions are
+/// fine; they are removed during [`build`].
 ///
 /// [`build`]: ByteStringSetBuilder::build
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct ByteStringSetBuilder<const N: usize> {
+    /// Keys buffered in memory; unused (always empty) when `spill` is active.
     keys: Vec<[u8; N]>,
+    /// External-sort state; `None` for the in-memory builder.
+    spill: Option<external::SpillState>,
 }
 
 impl<const N: usize> ByteStringSetBuilder<N> {
+    /// Create a builder that uses an external most-significant-byte radix sort so the full key
+    /// set never has to fit in memory.
+    ///
+    /// Inserted keys stream to an anonymous spill file instead of a `Vec`. [`build`] then
+    /// recursively partitions the spilled keys by successive leading bytes until each bucket is
+    /// at most `max_bucket_bytes`, sorts one bucket at a time in memory, and streams the
+    /// deduplicated prefixes to a temporary data file that backs the finished set as a memory
+    /// map. Peak memory during the build is therefore roughly `max_bucket_bytes` plus the fixed
+    /// offset table.
+    ///
+    /// Temporary files are created in the system temporary directory (honoring the `TMPDIR`
+    /// environment variable); if that is a RAM-backed filesystem such as a `tmpfs` `/tmp`, point
+    /// `TMPDIR` at a disk-backed directory to get the full benefit. Values of `max_bucket_bytes`
+    /// smaller than `N` are treated as `N`, since a bucket must hold at least one key.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_bucket_bytes` - Largest bucket of raw `N`-byte keys, in bytes, that [`build`] may
+    ///   load and sort in memory at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the spill file cannot be created.
+    ///
+    /// [`build`]: ByteStringSetBuilder::build
+    pub fn with_max_bucket_bytes(max_bucket_bytes: usize) -> Result<Self, Error> {
+        Ok(Self {
+            keys: Vec::new(),
+            spill: Some(external::SpillState::new(max_bucket_bytes.max(N))?),
+        })
+    }
+
     /// Add a key to the set under construction.
-    pub fn insert(&mut self, key: [u8; N]) {
-        self.keys.push(key);
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if writing to the spill file fails; in-memory builders (from
+    /// [`ByteStringSet::builder`]) never fail.
+    pub fn insert(&mut self, key: [u8; N]) -> Result<(), Error> {
+        match &mut self.spill {
+            None => {
+                self.keys.push(key);
+                Ok(())
+            }
+            Some(spill) => Ok(spill.insert(&key)?),
+        }
     }
 
     /// Sort and deduplicate the inserted keys by their first `prefix_len` bytes and produce the
     /// finished set.
+    ///
+    /// In-memory builders sort in place and keep the result in an owned buffer. External
+    /// builders ([`Self::with_max_bucket_bytes`]) instead stream the spilled keys through a
+    /// recursive most-significant-byte partition, sort one bucket at a time, and memory-map the
+    /// finished set from an anonymous temporary file.
     ///
     /// # Arguments
     ///
@@ -185,27 +275,22 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidPrefixLen`] if `prefix_len` is outside `3..=N`, and
+    /// Returns [`Error::InvalidPrefixLen`] if `prefix_len` is outside `3..=N`,
     /// [`Error::TooManyEntries`] if the deduplicated entry count overflows the `u32` offset
-    /// table.
+    /// table, and [`Error::Io`] if an external build cannot read or write its temporary files.
     pub fn build(mut self, prefix_len: usize) -> Result<ByteStringSet<N>, Error> {
         if !(OFFSET_TABLE_PREFIX_LEN..=N).contains(&prefix_len) {
             Err(Error::InvalidPrefixLen {
                 prefix_len,
                 key_len: N,
             })
+        } else if let Some(spill) = self.spill {
+            spill.build(prefix_len)
         } else {
-            // Lexicographic sort of the full keys also sorts their prefixes, so keys sharing a
-            // prefix end up adjacent for `dedup_by` below.
-            self.keys.sort_unstable();
-            // `dedup_by` drops an element when the closure says it matches the element kept
-            // immediately before it — here, same first `P` bytes.
-            self.keys
-                .dedup_by(|next, kept| next[..prefix_len] == kept[..prefix_len]);
+            // Capacity is computed before deduplication, so this can over-allocate, matching
+            // the previous behavior of reserving one stride per inserted key.
             let mut data = Vec::with_capacity(self.keys.len() * prefix_len);
-            for key in &self.keys {
-                data.extend_from_slice(&key[..prefix_len]);
-            }
+            sort_dedup_emit(&mut self.keys, prefix_len, &mut data)?;
             let offsets = build_offsets(&data, prefix_len)?;
             Ok(ByteStringSet {
                 prefix_len,
@@ -361,12 +446,8 @@ impl<const N: usize> ByteStringSet<N> {
     ///
     /// [`read`]: ByteStringSet::read
     pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut header = [0u8; HEADER_LEN];
-        header[..4].copy_from_slice(&MAGIC);
-        header[4] = FORMAT_VERSION;
-        header[8..16].copy_from_slice(&(self.prefix_len as u64).to_le_bytes());
         let mut file = File::create(path)?;
-        file.write_all(&header)?;
+        write_header(&mut file, self.prefix_len)?;
         file.write_all(self.data.as_slice())?;
         Ok(())
     }
@@ -389,9 +470,23 @@ mod tests {
     fn sample_set() -> ByteStringSet<4> {
         let mut builder = ByteStringSet::<4>::builder();
         for key in [*b"abcd", *b"abce", *b"zzzz", *b"\x00\x00\x00\x01"] {
-            builder.insert(key);
+            builder.insert(key).expect("insert key");
         }
         builder.build(4).expect("valid build")
+    }
+
+    /// Build a set with the external-sort builder from `keys`.
+    fn external_set<const N: usize>(
+        max_bucket_bytes: usize,
+        keys: &[[u8; N]],
+        prefix_len: usize,
+    ) -> ByteStringSet<N> {
+        let mut builder = ByteStringSetBuilder::<N>::with_max_bucket_bytes(max_bucket_bytes)
+            .expect("create spill file");
+        for &key in keys {
+            builder.insert(key).expect("spill key");
+        }
+        builder.build(prefix_len).expect("valid build")
     }
 
     #[test]
@@ -409,8 +504,8 @@ mod tests {
     #[test]
     fn prefix_lookup_matches_shared_prefixes() {
         let mut builder = ByteStringSet::<8>::builder();
-        builder.insert(*b"abcd1234");
-        builder.insert(*b"wxyz0000");
+        builder.insert(*b"abcd1234").expect("insert key");
+        builder.insert(*b"wxyz0000").expect("insert key");
         let set = builder.build(4).expect("valid build");
         // Only the first 4 bytes are kept, so any suffix matches.
         assert!(set.lookup(*b"abcdXXXX"));
@@ -421,9 +516,9 @@ mod tests {
     #[test]
     fn duplicates_and_shared_prefixes_are_deduped() {
         let mut builder = ByteStringSet::<8>::builder();
-        builder.insert(*b"abcd1234");
-        builder.insert(*b"abcd1234");
-        builder.insert(*b"abcd9999");
+        builder.insert(*b"abcd1234").expect("insert key");
+        builder.insert(*b"abcd1234").expect("insert key");
+        builder.insert(*b"abcd9999").expect("insert key");
         let set = builder.build(4).expect("valid build");
         assert_eq!(set.len(), 1);
     }
@@ -437,21 +532,80 @@ mod tests {
 
     #[test]
     fn prefix_len_bounds_are_enforced() {
-        let builder = ByteStringSet::<4>::builder();
         assert!(matches!(
-            builder.clone().build(2),
+            ByteStringSet::<4>::builder().build(2),
             Err(Error::InvalidPrefixLen {
                 prefix_len: 2,
                 key_len: 4
             })
         ));
         assert!(matches!(
-            builder.build(5),
+            ByteStringSet::<4>::builder().build(5),
             Err(Error::InvalidPrefixLen {
                 prefix_len: 5,
                 key_len: 4
             })
         ));
+    }
+
+    #[test]
+    fn external_build_single_bucket() {
+        // A huge budget keeps the whole spill file in one bucket, exercising the load-and-sort
+        // path without any partitioning.
+        let set = external_set(usize::MAX, &[*b"abcd", *b"abce", *b"zzzz", *b"abcd"], 4);
+        assert_eq!(set.len(), 3);
+        assert!(set.lookup(*b"abcd"));
+        assert!(set.lookup(*b"abce"));
+        assert!(set.lookup(*b"zzzz"));
+        assert!(!set.lookup(*b"aaaa"));
+    }
+
+    #[test]
+    fn external_build_partitions_oversized_buckets() {
+        // A one-key budget forces partitioning down to single-key buckets and, for the repeated
+        // "aaaa" keys, all the way to the shared-prefix early exit at `depth == prefix_len`.
+        let keys = [
+            *b"aaaa", *b"aaab", *b"aaba", *b"abaa", *b"baaa", *b"aaaa", *b"zzzz",
+        ];
+        let set = external_set(4, &keys, 4);
+        assert_eq!(set.len(), 6);
+        for &key in &keys {
+            assert!(set.lookup(key));
+        }
+        assert!(!set.lookup(*b"aabb"));
+    }
+
+    #[test]
+    fn external_build_dedupes_shared_prefixes() {
+        // Keys sharing a 4-byte prefix collapse to one entry even when partitioning separates
+        // sorting into single-key buckets.
+        let keys = [*b"abcd1234", *b"abcd9999", *b"wxyz0000"];
+        let set = external_set(8, &keys, 4);
+        assert_eq!(set.len(), 2);
+        assert!(set.lookup(*b"abcdXXXX"));
+        assert!(set.lookup(*b"wxyz9999"));
+        assert!(!set.lookup(*b"abzz0000"));
+    }
+
+    #[test]
+    fn external_build_empty() {
+        let set = external_set::<4>(1024, &[], 4);
+        assert!(set.is_empty());
+        assert!(!set.lookup(*b"abcd"));
+    }
+
+    #[test]
+    fn external_build_roundtrips_through_file() {
+        let set = external_set(4, &[*b"abcd", *b"zzzz"], 4);
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("set.bin");
+        set.write(&path).expect("write data file");
+
+        let loaded = ByteStringSet::<4>::read(&path).expect("load data file");
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.lookup(*b"abcd"));
+        assert!(loaded.lookup(*b"zzzz"));
+        assert!(!loaded.lookup(*b"abce"));
     }
 
     #[test]
@@ -567,7 +721,7 @@ mod proptests {
     fn build_set(keys: &[[u8; KEY_LEN]], prefix_len: usize) -> ByteStringSet<KEY_LEN> {
         let mut builder = ByteStringSet::<KEY_LEN>::builder();
         for &key in keys {
-            builder.insert(key);
+            builder.insert(key).expect("in-memory insert cannot fail");
         }
         builder
             .build(prefix_len)
@@ -609,6 +763,28 @@ mod proptests {
             prop_assert_eq!(loaded.len(), set.len());
             for &probe in keys.iter().chain(&probes) {
                 prop_assert_eq!(loaded.lookup(probe), set.lookup(probe));
+            }
+        }
+
+        #[test]
+        fn external_build_matches_in_memory(
+            keys in proptest::collection::vec(key_strategy(), 0..64),
+            probes in proptest::collection::vec(key_strategy(), 0..64),
+            prefix_len in OFFSET_TABLE_PREFIX_LEN..=KEY_LEN,
+            // Small budgets force deep recursive partitioning; the unit tests cover the
+            // single-bucket case.
+            max_bucket_bytes in 0usize..=128,
+        ) {
+            let in_memory = build_set(&keys, prefix_len);
+            let mut builder = ByteStringSetBuilder::<KEY_LEN>::with_max_bucket_bytes(max_bucket_bytes)
+                .expect("create spill file");
+            for &key in &keys {
+                builder.insert(key).expect("spill key");
+            }
+            let external = builder.build(prefix_len).expect("valid build");
+            prop_assert_eq!(external.len(), in_memory.len());
+            for &probe in keys.iter().chain(&probes) {
+                prop_assert_eq!(external.lookup(probe), in_memory.lookup(probe));
             }
         }
     }
