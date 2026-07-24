@@ -16,9 +16,9 @@
 //! A lookup is one table read plus a binary search inside a single bucket. The table costs a
 //! fixed 64 MiB per set, which pays off for large sets.
 //!
-//! Building normally buffers all keys in memory. For sets that do not fit,
-//! [`ByteStringSetBuilder::with_max_bucket_bytes`] spills keys to temporary files and builds the
-//! set with an external most-significant-byte radix sort instead.
+//! Building normally buffers all keys in memory. For sets that may not fit in memory,
+//! [`ByteStringSet::external_builder`] spills keys to temporary files and builds the set with an
+//! external most-significant-byte radix sort instead.
 //!
 //! # Examples
 //!
@@ -195,12 +195,11 @@ fn sort_dedup_emit<const N: usize>(
 
 /// Accumulates `[u8; N]` keys and builds a [`ByteStringSet`].
 ///
-/// Obtained from [`ByteStringSet::builder`] (in-memory) or
-/// [`ByteStringSetBuilder::with_max_bucket_bytes`] (external sort). Duplicate insertions are
-/// fine; they are removed during [`build`].
+/// Obtained from [`ByteStringSet::builder`] (in-memory) or [`ByteStringSet::external_builder`]
+/// (external sort). Duplicate insertions are fine; they are removed during [`build`].
 ///
 /// [`build`]: ByteStringSetBuilder::build
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ByteStringSetBuilder<const N: usize> {
     /// Keys buffered in memory; unused (always empty) when `spill` is active.
     keys: Vec<[u8; N]>,
@@ -208,39 +207,13 @@ pub struct ByteStringSetBuilder<const N: usize> {
     spill: Option<external::SpillState>,
 }
 
-impl<const N: usize> ByteStringSetBuilder<N> {
-    /// Create a builder that uses an external most-significant-byte radix sort so the full key
-    /// set never has to fit in memory.
-    ///
-    /// Inserted keys stream to an anonymous spill file instead of a `Vec`. [`build`] then
-    /// recursively partitions the spilled keys by successive leading bytes until each bucket is
-    /// at most `max_bucket_bytes`, sorts one bucket at a time in memory, and streams the
-    /// deduplicated prefixes to a temporary data file that backs the finished set as a memory
-    /// map. Peak memory during the build is therefore roughly `max_bucket_bytes` plus the fixed
-    /// offset table.
-    ///
-    /// Temporary files are created in the system temporary directory (honoring the `TMPDIR`
-    /// environment variable); if that is a RAM-backed filesystem such as a `tmpfs` `/tmp`, point
-    /// `TMPDIR` at a disk-backed directory to get the full benefit. Values of `max_bucket_bytes`
-    /// smaller than `N` are treated as `N`, since a bucket must hold at least one key.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_bucket_bytes` - Largest bucket of raw `N`-byte keys, in bytes, that [`build`] may
-    ///   load and sort in memory at once.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Io`] if the spill file cannot be created.
-    ///
-    /// [`build`]: ByteStringSetBuilder::build
-    pub fn with_max_bucket_bytes(max_bucket_bytes: usize) -> Result<Self, Error> {
-        Ok(Self {
-            keys: Vec::new(),
-            spill: Some(external::SpillState::new(max_bucket_bytes.max(N))?),
-        })
+impl<const N: usize> Default for ByteStringSetBuilder<N> {
+    fn default() -> Self {
+        ByteStringSet::builder()
     }
+}
 
+impl<const N: usize> ByteStringSetBuilder<N> {
     /// Add a key to the set under construction.
     ///
     /// # Arguments
@@ -265,9 +238,9 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     /// finished set.
     ///
     /// In-memory builders sort in place and keep the result in an owned buffer. External
-    /// builders ([`Self::with_max_bucket_bytes`]) instead stream the spilled keys through a
-    /// recursive most-significant-byte partition, sort one bucket at a time, and memory-map the
-    /// finished set from an anonymous temporary file.
+    /// builders (from [`ByteStringSet::external_builder`]) instead stream the spilled keys
+    /// through a recursive most-significant-byte partition, sort one bucket at a time, and
+    /// memory-map the finished set from an anonymous temporary file.
     ///
     /// # Arguments
     ///
@@ -314,10 +287,50 @@ pub struct ByteStringSet<const N: usize> {
 }
 
 impl<const N: usize> ByteStringSet<N> {
-    /// Create an empty [`ByteStringSetBuilder`] for assembling a set from `[u8; N]` keys.
+    /// Create an empty builder that assembles a set from `[u8; N]` keys in memory.
+    ///
+    /// Inserted keys are buffered in a `Vec` and sorted during [`build`], so the full key set
+    /// must fit in memory; use [`external_builder`] for sets that may not.
+    ///
+    /// [`build`]: ByteStringSetBuilder::build
+    /// [`external_builder`]: ByteStringSet::external_builder
     #[must_use]
-    pub fn builder() -> ByteStringSetBuilder<N> {
-        ByteStringSetBuilder::default()
+    pub const fn builder() -> ByteStringSetBuilder<N> {
+        ByteStringSetBuilder {
+            keys: Vec::new(),
+            spill: None,
+        }
+    }
+
+    /// Create an empty builder that uses an external most-significant-byte radix sort so the
+    /// full key set never has to fit in memory.
+    ///
+    /// Inserted keys stream to an anonymous spill file, and [`build`] recursively partitions
+    /// them by successive leading bytes until each bucket is at most `max_bucket_bytes`, sorts
+    /// one bucket at a time in memory, and streams the deduplicated prefixes to a temporary data
+    /// file that backs the finished set as a memory map. Peak memory during the build is
+    /// therefore roughly `max_bucket_bytes` plus the fixed offset table.
+    ///
+    /// Temporary files are created in the system temporary directory (honoring the `TMPDIR`
+    /// environment variable); if that is a RAM-backed filesystem such as a `tmpfs` `/tmp`, point
+    /// `TMPDIR` at a disk-backed directory to get the full benefit. Values of `max_bucket_bytes`
+    /// smaller than `N` are treated as `N`, since a bucket must hold at least one key.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_bucket_bytes` - Largest bucket of raw `N`-byte keys, in bytes, that [`build`] may
+    ///   load and sort in memory at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the spill file cannot be created.
+    ///
+    /// [`build`]: ByteStringSetBuilder::build
+    pub fn external_builder(max_bucket_bytes: usize) -> Result<ByteStringSetBuilder<N>, Error> {
+        Ok(ByteStringSetBuilder {
+            keys: Vec::new(),
+            spill: Some(external::SpillState::new(max_bucket_bytes.max(N))?),
+        })
     }
 
     /// Load a set from a data file previously written by [`write`].
@@ -496,8 +509,8 @@ mod tests {
         keys: &[[u8; N]],
         prefix_len: usize,
     ) -> ByteStringSet<N> {
-        let mut builder = ByteStringSetBuilder::<N>::with_max_bucket_bytes(max_bucket_bytes)
-            .expect("create spill file");
+        let mut builder =
+            ByteStringSet::<N>::external_builder(max_bucket_bytes).expect("create spill file");
         for &key in keys {
             builder.insert(key).expect("spill key");
         }
@@ -791,7 +804,7 @@ mod proptests {
             max_bucket_bytes in 0usize..=128,
         ) {
             let in_memory = build_set(&keys, prefix_len);
-            let mut builder = ByteStringSetBuilder::<KEY_LEN>::with_max_bucket_bytes(max_bucket_bytes)
+            let mut builder = ByteStringSet::<KEY_LEN>::external_builder(max_bucket_bytes)
                 .expect("create spill file");
             for &key in &keys {
                 builder.insert(key).expect("spill key");

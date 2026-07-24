@@ -2,7 +2,7 @@
 //! a recursive most-significant-byte radix sort, so the full key set never has to fit in memory.
 //!
 //! This module is crate-private; it is reached through
-//! [`ByteStringSetBuilder::with_max_bucket_bytes`](crate::ByteStringSetBuilder::with_max_bucket_bytes).
+//! [`ByteStringSet::external_builder`](crate::ByteStringSet::external_builder).
 
 use memmap2::Mmap;
 use std::fs::{self, File};
