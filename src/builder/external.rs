@@ -16,14 +16,8 @@ use tempfile::TempDir;
 fn read_keys<const N: usize>(file: File, size: u64) -> io::Result<Vec<[u8; N]>> {
     let count = usize::try_from(size / N as u64)
         .expect("bucket size is bounded by a usize max_bucket_bytes");
-    let mut reader = BufReader::new(file);
-    let mut keys = Vec::with_capacity(count);
-    let mut key = [0u8; N];
-    for _ in 0..count {
-        reader.read_exact(&mut key)?;
-        // `[u8; N]` is `Copy`, so pushing copies the array rather than moving it.
-        keys.push(key);
-    }
+    let mut keys = Vec::new();
+    super::read_keys_into(&mut BufReader::new(file), count, N, &mut keys)?;
     Ok(keys)
 }
 
@@ -160,6 +154,16 @@ impl SpillState {
     /// Returns an error if writing to the spill file fails.
     pub(crate) fn insert(&mut self, key: &[u8]) -> io::Result<()> {
         self.writer.write_all(key)
+    }
+
+    /// Stream every remaining byte of `reader` (raw keys, back to back) to the spill file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or writing fails.
+    pub(crate) fn copy_from(&mut self, reader: &mut impl Read) -> io::Result<()> {
+        io::copy(reader, &mut self.writer)?;
+        Ok(())
     }
 
     /// Finish an external build: externally sort the spill file and memory-map the result.
