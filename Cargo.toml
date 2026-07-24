@@ -6,7 +6,7 @@ description = "Byte-string set with a fixed key length, prefix-based membership,
 edition = "2024"
 license = "AGPL-3.0-only"
 readme = "README.md"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
 memmap2 = "0.9"
