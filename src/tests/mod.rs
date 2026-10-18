@@ -2,6 +2,7 @@
 
 // SAFETY: each test owns its temporary files and leaves mapped files unchanged.
 
+mod lookup;
 mod proptests;
 
 use super::*;

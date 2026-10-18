@@ -8,13 +8,15 @@ use super::*;
 
 const KEY_LEN: usize = 8;
 
-/// Keys drawn from the full byte range or from a tiny alphabet; the latter forces shared
-/// prefixes, duplicate keys, and crowded offset-table buckets, which uniform random bytes
-/// almost never produce.
+/// Keys drawn from the full byte range, a tiny alphabet, or a single offset-table bucket.
+/// The latter two force shared prefixes, duplicate keys, and crowded buckets, which uniform
+/// random bytes almost never produce.
 fn key_strategy() -> impl Strategy<Value = [u8; KEY_LEN]> {
     prop_oneof![
         proptest::array::uniform8(any::<u8>()),
         proptest::array::uniform8(0u8..4),
+        proptest::array::uniform5(any::<u8>())
+            .prop_map(|tail| [0, 0, 0, tail[0], tail[1], tail[2], tail[3], tail[4]]),
     ]
 }
 
@@ -48,6 +50,19 @@ proptest! {
         for &probe in keys.iter().chain(&probes) {
             prop_assert_eq!(set.lookup(probe), reference.contains(&probe[..prefix_len]));
         }
+        let mut batch: Vec<_> = keys.iter().chain(&probes).copied().collect();
+        for sorted in [false, true] {
+            if sorted {
+                batch.sort_unstable();
+            }
+            let expected: Vec<_> = batch.iter()
+                .map(|probe| reference.contains(&probe[..prefix_len]))
+                .collect();
+            prop_assert_eq!(&set.lookup_all(&batch).collect::<Vec<_>>(), &expected);
+            if sorted {
+                prop_assert_eq!(set.lookup_all_sorted(&batch).collect::<Vec<_>>(), expected);
+            }
+        }
     }
 
     #[test]
@@ -67,6 +82,12 @@ proptest! {
         for &probe in keys.iter().chain(&probes) {
             prop_assert_eq!(loaded.lookup(probe), set.lookup(probe));
         }
+        let mut batch: Vec<_> = keys.iter().chain(&probes).copied().collect();
+        batch.sort_unstable();
+        prop_assert_eq!(
+            loaded.lookup_all_sorted(&batch).collect::<Vec<_>>(),
+            set.lookup_all_sorted(&batch).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -36,8 +36,8 @@
 //! ```
 
 pub mod builder;
+mod lookup;
 
-use std::cmp::Ordering;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -346,38 +346,6 @@ impl<const N: usize> ByteStringSet<N> {
                 offsets,
             })
         }
-    }
-
-    /// Test whether a key's first `P` bytes are in the set.
-    ///
-    /// Exact membership when `prefix_len == N`; otherwise true if any member shares the key's
-    /// `P`-byte prefix.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key to probe.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the key's `P`-byte prefix is present.
-    #[must_use]
-    pub fn lookup(&self, key: [u8; N]) -> bool {
-        let probe = &key[..self.prefix_len];
-        let data = self.data.as_slice();
-        // The first 3 bytes select a bucket; binary-search the rest of it.
-        let bucket = table_index(probe);
-        let mut low = self.offsets[bucket] as usize;
-        let mut high = self.offsets[bucket + 1] as usize;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let start = middle * self.prefix_len;
-            match data[start..start + self.prefix_len].cmp(probe) {
-                Ordering::Less => low = middle + 1,
-                Ordering::Greater => high = middle,
-                Ordering::Equal => return true,
-            }
-        }
-        false
     }
 
     /// Number of distinct `P`-byte prefixes stored.
