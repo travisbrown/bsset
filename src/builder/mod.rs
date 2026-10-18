@@ -2,13 +2,14 @@
 
 mod external;
 
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::path::Path;
+
 use self::external::SpillState;
 use crate::{
     ByteStringSet, Error, HEADER_LEN, OFFSET_TABLE_PREFIX_LEN, Storage, build_offsets, parse_header,
 };
-use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
-use std::path::Path;
 
 /// Sort `keys`, drop all but the first key of each distinct `prefix_len`-byte prefix, and write
 /// the surviving prefixes to `out` in order.

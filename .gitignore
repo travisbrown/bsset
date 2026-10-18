@@ -1,5 +1,5 @@
-Cargo.lock
 target/
 tmp/
 .RData
 .Rhistory
+lcov.info

@@ -4,13 +4,15 @@
 //! This module is private to [`builder`](crate::builder); it is reached through
 //! [`ByteStringSet::external_builder`](crate::ByteStringSet::external_builder).
 
-use super::sort_dedup_emit;
-use crate::{ByteStringSet, Error, HEADER_LEN, Storage, build_offsets, write_header};
-use memmap2::Mmap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
+
+use memmap2::Mmap;
 use tempfile::TempDir;
+
+use super::sort_dedup_emit;
+use crate::{ByteStringSet, Error, HEADER_LEN, Storage, build_offsets, write_header};
 
 /// Read a whole bucket of `N`-byte keys (`size` bytes) from `file` into memory.
 fn read_keys<const N: usize>(file: File, size: u64) -> io::Result<Vec<[u8; N]>> {
@@ -177,6 +179,7 @@ impl SpillState {
     ///
     /// Returns [`Error::TooManyEntries`] if the deduplicated entry count overflows the `u32`
     /// offset table, and [`Error::Io`] if a temporary file cannot be read or written.
+    #[allow(unsafe_code)]
     pub(crate) fn build<const N: usize>(
         self,
         prefix_len: usize,

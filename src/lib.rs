@@ -1,4 +1,3 @@
-#![warn(clippy::all, clippy::pedantic, clippy::nursery, rust_2018_idioms)]
 //! A byte-string set for fixed-length keys with prefix-based membership.
 //!
 //! Keys have a type-level length `N`. Each set also has a runtime prefix length (called `P` here).
@@ -38,12 +37,13 @@
 
 pub mod builder;
 
-use builder::ByteStringSetBuilder;
-use memmap2::Mmap;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+
+use builder::ByteStringSetBuilder;
+use memmap2::Mmap;
 use thiserror::Error;
 
 /// Number of bytes consumed by the first-level offset table.
@@ -136,7 +136,7 @@ impl Storage {
 }
 
 /// Offset table slot for a prefix: its first 3 bytes as a `usize`.
-fn table_index(prefix: &[u8]) -> usize {
+const fn table_index(prefix: &[u8]) -> usize {
     u32::from_be_bytes([0, prefix[0], prefix[1], prefix[2]]) as usize
 }
 
@@ -313,6 +313,7 @@ impl<const N: usize> ByteStringSet<N> {
     /// if the entry count overflows `u32`.
     ///
     /// [`write`]: ByteStringSet::write
+    #[allow(unsafe_code)]
     pub fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
         let file = File::open(path)?;
         // SAFETY: mapping a file is only unsound if another process truncates or rewrites it
