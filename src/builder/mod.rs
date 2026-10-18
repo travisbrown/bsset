@@ -3,7 +3,7 @@
 mod external;
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use self::external::SpillState;
@@ -11,22 +11,19 @@ use crate::{
     ByteStringSet, Error, HEADER_LEN, OFFSET_TABLE_PREFIX_LEN, Storage, build_offsets, parse_header,
 };
 
-/// Sort `keys`, drop all but the first key of each distinct `prefix_len`-byte prefix, and write
-/// the surviving prefixes to `out` in order.
-///
-/// Shared by the in-memory build and, bucket by bucket, the external build in [`external`].
-fn sort_dedup_emit<const N: usize>(
-    keys: &mut Vec<[u8; N]>,
+/// Sort and deduplicate keys by the prefix the finished set retains.
+fn sort_dedup<const N: usize>(keys: &mut Vec<[u8; N]>, prefix_len: usize) {
+    keys.sort_unstable_by(|left, right| left[..prefix_len].cmp(&right[..prefix_len]));
+    keys.dedup_by(|next, kept| next[..prefix_len] == kept[..prefix_len]);
+}
+
+/// Write the prefixes of sorted, deduplicated keys in order.
+fn emit<const N: usize>(
+    keys: &[[u8; N]],
     prefix_len: usize,
     out: &mut impl Write,
-) -> io::Result<()> {
-    // Lexicographic sort of the full keys also sorts their prefixes, so keys sharing a prefix
-    // end up adjacent for `dedup_by` below.
-    keys.sort_unstable();
-    // `dedup_by` drops an element when the closure says it matches the element kept immediately
-    // before it — here, same first `prefix_len` bytes.
-    keys.dedup_by(|next, kept| next[..prefix_len] == kept[..prefix_len]);
-    for key in keys.iter() {
+) -> std::io::Result<()> {
+    for key in keys {
         out.write_all(&key[..prefix_len])?;
     }
     Ok(())
@@ -39,16 +36,19 @@ fn read_keys_into<const N: usize>(
     count: usize,
     prefix_len: usize,
     keys: &mut Vec<[u8; N]>,
-) -> io::Result<()> {
-    keys.reserve(count);
+) -> std::io::Result<()> {
+    keys.try_reserve(count).map_err(std::io::Error::other)?;
+    let original_len = keys.len();
     let mut key = [0u8; N];
-    for _ in 0..count {
-        // Only the first `prefix_len` bytes are overwritten; the rest stay zero.
+    let result = (0..count).try_for_each(|_| {
         reader.read_exact(&mut key[..prefix_len])?;
-        // `[u8; N]` is `Copy`, so pushing copies the array rather than moving it.
         keys.push(key);
+        Ok(())
+    });
+    if result.is_err() {
+        keys.truncate(original_len);
     }
-    Ok(())
+    result
 }
 
 /// Accumulates `[u8; N]` keys and builds a [`ByteStringSet`].
@@ -64,7 +64,7 @@ pub struct ByteStringSetBuilder<const N: usize> {
     /// Keys buffered in memory; unused (always empty) when `spill` is active.
     keys: Vec<[u8; N]>,
     /// External-sort state; `None` for the in-memory builder.
-    spill: Option<SpillState>,
+    spill: Option<SpillState<N>>,
     /// The prefix length (`P`) the finished set will match on; range-validated by
     /// [`build`](Self::build) and [`import`](Self::import) rather than at construction.
     prefix_len: usize,
@@ -96,7 +96,7 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     pub(crate) fn external(prefix_len: usize, max_bucket_bytes: usize) -> Result<Self, Error> {
         Ok(Self {
             keys: Vec::new(),
-            spill: Some(SpillState::new(max_bucket_bytes.max(N))?),
+            spill: Some(SpillState::new(max_bucket_bytes)?),
             prefix_len,
         })
     }
@@ -110,7 +110,8 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     /// # Errors
     ///
     /// Returns [`Error::Io`] if writing to the spill file fails; in-memory builders (from
-    /// [`ByteStringSet::builder`]) never fail.
+    /// [`ByteStringSet::builder`]) never fail. An external builder cannot be used after a
+    /// failed write.
     pub fn insert(&mut self, key: [u8; N]) -> Result<(), Error> {
         match &mut self.spill {
             None => {
@@ -129,7 +130,12 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     /// reaches a finished set, because the builder's shorter-or-equal prefix length always
     /// truncates it away. The imported entries join the keys inserted so far, so several sets
     /// (plus loose keys) can be merged into one build. Import order does not matter: [`build`]
-    /// re-sorts and deduplicates everything.
+    /// re-sorts and deduplicates everything. The input file must remain unchanged during import.
+    ///
+    /// A failed in-memory import leaves the existing keys unchanged. An I/O failure while
+    /// appending imported entries invalidates an external builder; subsequent inserts, imports,
+    /// and builds return an I/O error. Failures detected before any entries are read (such as
+    /// an invalid header or a misaligned file) leave either builder usable.
     ///
     /// # Arguments
     ///
@@ -142,7 +148,7 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     /// version, [`Error::InvalidPrefixLen`] if the builder's or the file's prefix length is
     /// outside `3..=N`, [`Error::PrefixLenExceedsImport`] if the file's prefix length is
     /// shorter than the builder's, and [`Error::Misaligned`] if the data size is not a whole
-    /// number of entries.
+    /// number of entries. Allocation failures while buffering an import return [`Error::Io`].
     ///
     /// [`build`]: ByteStringSetBuilder::build
     pub fn import(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
@@ -182,21 +188,10 @@ impl<const N: usize> ByteStringSetBuilder<N> {
         }
         let count = data_len / imported_prefix_len as u64;
         if let Some(spill) = &mut self.spill {
-            if imported_prefix_len == N {
-                // Full keys match the spill file's layout exactly; stream the bytes over
-                // without parsing them into keys at all.
-                spill.copy_from(&mut reader)?;
-            } else {
-                let mut key = [0u8; N];
-                for _ in 0..count {
-                    // Only the entry's bytes are overwritten; the rest stay zero.
-                    reader.read_exact(&mut key[..imported_prefix_len])?;
-                    spill.insert(&key)?;
-                }
-            }
+            spill.import(&mut reader, count, imported_prefix_len)?;
         } else {
             let count = usize::try_from(count)
-                .map_err(|_| io::Error::other("data file too large to buffer in memory"))?;
+                .map_err(|_| std::io::Error::other("data file too large to buffer in memory"))?;
             read_keys_into(&mut reader, count, imported_prefix_len, &mut self.keys)?;
         }
         Ok(())
@@ -207,14 +202,15 @@ impl<const N: usize> ByteStringSetBuilder<N> {
     ///
     /// In-memory builders sort in place and keep the result in an owned buffer. External
     /// builders (from [`ByteStringSet::external_builder`]) instead stream the spilled keys
-    /// through a recursive most-significant-byte partition, sort one bucket at a time, and
+    /// through most-significant-byte partitioning, sort one bucket at a time, and
     /// memory-map the finished set from an anonymous temporary file.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidPrefixLen`] if the builder's prefix length is outside `3..=N`,
     /// [`Error::TooManyEntries`] if the deduplicated entry count overflows the `u32` offset
-    /// table, and [`Error::Io`] if an external build cannot read or write its temporary files.
+    /// table, and [`Error::Io`] if an external build cannot read or write its temporary files
+    /// or was invalidated by a failed insert or import.
     pub fn build(mut self) -> Result<ByteStringSet<N>, Error> {
         let prefix_len = self.prefix_len;
         if !(OFFSET_TABLE_PREFIX_LEN..=N).contains(&prefix_len) {
@@ -225,10 +221,11 @@ impl<const N: usize> ByteStringSetBuilder<N> {
         } else if let Some(spill) = self.spill {
             spill.build(prefix_len)
         } else {
-            // Capacity is computed before deduplication, so this can over-allocate, matching
-            // the previous behavior of reserving one stride per inserted key.
+            sort_dedup(&mut self.keys, prefix_len);
             let mut data = Vec::with_capacity(self.keys.len() * prefix_len);
-            sort_dedup_emit(&mut self.keys, prefix_len, &mut data)?;
+            emit(&self.keys, prefix_len, &mut data)?;
+            // Release the full keys before allocating the 64 MiB offset table.
+            drop(self.keys);
             let offsets = build_offsets(&data, prefix_len)?;
             Ok(ByteStringSet {
                 prefix_len,
@@ -236,5 +233,26 @@ impl<const N: usize> ByteStringSetBuilder<N> {
                 offsets,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_import_preserves_existing_keys() {
+        let mut keys = vec![*b"keep"];
+        let error = read_keys_into(&mut b"abcdx".as_slice(), 2, 4, &mut keys)
+            .expect_err("second key is truncated");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(keys, [*b"keep"]);
+    }
+
+    #[test]
+    fn impossible_import_capacity_returns_an_error() {
+        let mut keys = vec![*b"keep"];
+        assert!(read_keys_into(&mut std::io::empty(), usize::MAX, 4, &mut keys).is_err());
+        assert_eq!(keys, [*b"keep"]);
     }
 }

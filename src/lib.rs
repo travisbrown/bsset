@@ -39,7 +39,7 @@ pub mod builder;
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 
 use builder::ByteStringSetBuilder;
@@ -114,7 +114,7 @@ pub enum Error {
     },
     /// An underlying filesystem operation failed.
     #[error(transparent)]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
 }
 
 /// Backing storage for the prefix buffer: built in memory or mapped from disk.
@@ -152,31 +152,26 @@ const fn table_index(prefix: &[u8]) -> usize {
 fn build_offsets(data: &[u8], prefix_len: usize) -> Result<Vec<u32>, Error> {
     let count = data.len() / prefix_len;
 
-    if count > u32::MAX as usize {
-        Err(Error::TooManyEntries { count })
-    } else {
-        let mut offsets = vec![0u32; OFFSET_TABLE_LEN];
-        let mut previous: Option<&[u8]> = None;
-        for (index, entry) in data.chunks_exact(prefix_len).enumerate() {
-            if previous.is_some_and(|previous| previous >= entry) {
-                return Err(Error::Unsorted { index });
-            }
-            offsets[table_index(entry) + 1] += 1;
-            previous = Some(entry);
+    let count = u32::try_from(count).map_err(|_| Error::TooManyEntries { count })?;
+    let mut offsets = Vec::with_capacity(OFFSET_TABLE_LEN);
+    let mut previous: Option<&[u8]> = None;
+    for (index, entry) in (0..count).zip(data.chunks_exact(prefix_len)) {
+        if previous.is_some_and(|previous| previous >= entry) {
+            return Err(Error::Unsorted {
+                index: index as usize,
+            });
         }
-        // Convert per-bucket counts into cumulative start offsets, so bucket `i` spans entry
-        // indices `offsets[i]..offsets[i + 1]`.
-        let mut running = 0u32;
-        for slot in &mut offsets {
-            running += *slot;
-            *slot = running;
-        }
-        Ok(offsets)
+        // Sorted entries let us fill empty buckets and the next occupied bucket directly.
+        // Repeated entries in the same bucket leave its start offset unchanged.
+        offsets.resize(table_index(entry) + 1, index);
+        previous = Some(entry);
     }
+    offsets.resize(OFFSET_TABLE_LEN, count);
+    Ok(offsets)
 }
 
 /// Write the data file header (magic, format version, and prefix length) to `out`.
-fn write_header(out: &mut impl Write, prefix_len: usize) -> io::Result<()> {
+fn write_header(out: &mut impl Write, prefix_len: usize) -> std::io::Result<()> {
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(&MAGIC);
     header[4] = FORMAT_VERSION;
@@ -259,11 +254,13 @@ impl<const N: usize> ByteStringSet<N> {
     /// Create an empty builder that uses an external most-significant-byte radix sort so the
     /// full key set never has to fit in memory.
     ///
-    /// Inserted keys stream to an anonymous spill file, and [`build`] recursively partitions
+    /// Inserted keys stream to an anonymous spill file, and [`build`] partitions
     /// them by successive leading bytes until each bucket is at most `max_bucket_bytes`, sorts
     /// one bucket at a time in memory, and streams the deduplicated prefixes to a temporary data
     /// file that backs the finished set as a memory map. Peak memory during the build is
-    /// therefore roughly `max_bucket_bytes` plus the fixed offset table.
+    /// therefore roughly `max_bucket_bytes` plus the fixed offset table and I/O buffers.
+    /// Partitioning may open up to 256 temporary files at once. Shared prefix bytes are skipped,
+    /// and each input partition is deleted before its children are processed.
     ///
     /// Temporary files are created in the system temporary directory (honoring the `TMPDIR`
     /// environment variable); if that is a RAM-backed filesystem such as a `tmpfs` `/tmp`, point
@@ -295,9 +292,13 @@ impl<const N: usize> ByteStringSet<N> {
     ///
     /// The file is memory-mapped rather than read into memory. Its header records the prefix
     /// length `P`, and the offset table (which is never serialized) is rebuilt by scanning the
-    /// mapped data, which also validates that entries are sorted and deduplicated. The file must
-    /// not be modified while the returned set is alive: mapped memory changing underneath the
-    /// process is undefined behavior, which the operating system cannot guard against.
+    /// mapped data, which also validates that entries are sorted and deduplicated.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the underlying file is not modified or truncated, by this
+    /// process or any other, from the start of this call until the returned set is dropped.
+    /// Replacing a directory entry without modifying the mapped file is safe.
     ///
     /// # Arguments
     ///
@@ -313,11 +314,13 @@ impl<const N: usize> ByteStringSet<N> {
     /// if the entry count overflows `u32`.
     ///
     /// [`write`]: ByteStringSet::write
-    #[allow(unsafe_code)]
-    pub fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
+    #[expect(unsafe_code, reason = "mapping a file the caller keeps unchanged")]
+    pub unsafe fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
         let file = File::open(path)?;
-        // SAFETY: mapping a file is only unsound if another process truncates or rewrites it
-        // while mapped; callers must uphold the immutability requirement documented above.
+        if file.metadata()?.len() < HEADER_LEN as u64 {
+            return Err(Error::BadHeader);
+        }
+        // SAFETY: the caller guarantees that the file remains unchanged until the set is dropped.
         let map = unsafe { Mmap::map(&file)? };
         // `split_first_chunk` returns the leading bytes as a fixed-size `&[u8; HEADER_LEN]`
         // array (plus the rest of the map), or `None` if the map is too short.
@@ -400,512 +403,45 @@ impl<const N: usize> ByteStringSet<N> {
     /// The file is a small header (magic, format version, and the prefix length `P`) followed by
     /// the packed prefix strides; the offset table is reconstructed on load.
     ///
+    /// A temporary file in the destination directory is written in full and synchronized to
+    /// storage, then atomically replaces the destination, so a crash cannot leave a partially
+    /// written file there. The directory is not synchronized, so after a crash the destination
+    /// may still hold its previous contents. Existing memory maps and hard links keep their
+    /// original data, and a destination symlink is replaced rather than followed. Some
+    /// platforms may reject replacing a mapped file, in which case the existing file is left
+    /// intact.
+    ///
+    /// The directory must be writable. On Unix the new file gets the permissions of any newly
+    /// created file (`0o666` less the umask); an existing file's permissions are not preserved.
+    ///
     /// # Arguments
     ///
-    /// * `path` - Destination file; created or truncated.
+    /// * `path` - Destination file; created or replaced.
     ///
     /// # Errors
     ///
-    /// Returns [`io::Error`] if the file cannot be created or written; IO is the only way this
+    /// Returns [`std::io::Error`] if the file cannot be created or written; IO is the only way this
     /// operation can fail.
     ///
     /// [`read`]: ByteStringSet::read
-    pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut file = File::create(path)?;
+    pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut builder = tempfile::Builder::new();
+        // tempfile defaults to owner-only permissions; match `File::create` instead.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        let mut file = builder.tempfile_in(parent)?;
         write_header(&mut file, self.prefix_len)?;
         file.write_all(self.data.as_slice())?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|error| error.error)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Compose a data file image: a valid header followed by `payload`.
-    fn raw_file(prefix_len: u64, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![0u8; HEADER_LEN];
-        bytes[..4].copy_from_slice(&MAGIC);
-        bytes[4] = FORMAT_VERSION;
-        bytes[8..16].copy_from_slice(&prefix_len.to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
-    }
-
-    fn sample_set() -> ByteStringSet<4> {
-        let mut builder = ByteStringSet::<4>::builder();
-        for key in [*b"abcd", *b"abce", *b"zzzz", *b"\x00\x00\x00\x01"] {
-            builder.insert(key).expect("insert key");
-        }
-        builder.build().expect("valid build")
-    }
-
-    /// Build a set with the external-sort builder from `keys`.
-    fn external_set<const N: usize>(
-        max_bucket_bytes: usize,
-        keys: &[[u8; N]],
-        prefix_len: usize,
-    ) -> ByteStringSet<N> {
-        let mut builder = ByteStringSet::<N>::external_builder(prefix_len, max_bucket_bytes)
-            .expect("create spill file");
-        for &key in keys {
-            builder.insert(key).expect("spill key");
-        }
-        builder.build().expect("valid build")
-    }
-
-    #[test]
-    fn exact_lookup_hits_and_misses() {
-        let set = sample_set();
-        assert!(set.lookup(*b"abcd"));
-        assert!(set.lookup(*b"abce"));
-        assert!(set.lookup(*b"zzzz"));
-        assert!(set.lookup(*b"\x00\x00\x00\x01"));
-        assert!(!set.lookup(*b"abcf"));
-        assert!(!set.lookup(*b"\x00\x00\x00\x00"));
-        assert_eq!(set.len(), 4);
-    }
-
-    #[test]
-    fn prefix_lookup_matches_shared_prefixes() {
-        let mut builder = ByteStringSet::<8>::builder_with_prefix_len(4);
-        builder.insert(*b"abcd1234").expect("insert key");
-        builder.insert(*b"wxyz0000").expect("insert key");
-        let set = builder.build().expect("valid build");
-        // Only the first 4 bytes are kept, so any suffix matches.
-        assert!(set.lookup(*b"abcdXXXX"));
-        assert!(set.lookup(*b"wxyz9999"));
-        assert!(!set.lookup(*b"abzz1234"));
-    }
-
-    #[test]
-    fn duplicates_and_shared_prefixes_are_deduped() {
-        let mut builder = ByteStringSet::<8>::builder_with_prefix_len(4);
-        builder.insert(*b"abcd1234").expect("insert key");
-        builder.insert(*b"abcd1234").expect("insert key");
-        builder.insert(*b"abcd9999").expect("insert key");
-        let set = builder.build().expect("valid build");
-        assert_eq!(set.len(), 1);
-    }
-
-    #[test]
-    fn empty_set_misses_everything() {
-        let set = ByteStringSet::<4>::builder().build().expect("valid build");
-        assert!(set.is_empty());
-        assert!(!set.lookup(*b"abcd"));
-    }
-
-    #[test]
-    fn prefix_len_bounds_are_enforced() {
-        assert!(matches!(
-            ByteStringSet::<4>::builder_with_prefix_len(2).build(),
-            Err(Error::InvalidPrefixLen {
-                prefix_len: 2,
-                key_len: 4
-            })
-        ));
-        assert!(matches!(
-            ByteStringSet::<4>::builder_with_prefix_len(5).build(),
-            Err(Error::InvalidPrefixLen {
-                prefix_len: 5,
-                key_len: 4
-            })
-        ));
-    }
-
-    #[test]
-    fn external_build_single_bucket() {
-        // A huge budget keeps the whole spill file in one bucket, exercising the load-and-sort
-        // path without any partitioning.
-        let set = external_set(usize::MAX, &[*b"abcd", *b"abce", *b"zzzz", *b"abcd"], 4);
-        assert_eq!(set.len(), 3);
-        assert!(set.lookup(*b"abcd"));
-        assert!(set.lookup(*b"abce"));
-        assert!(set.lookup(*b"zzzz"));
-        assert!(!set.lookup(*b"aaaa"));
-    }
-
-    #[test]
-    fn external_build_partitions_oversized_buckets() {
-        // A one-key budget forces partitioning down to single-key buckets and, for the repeated
-        // "aaaa" keys, all the way to the shared-prefix early exit at `depth == prefix_len`.
-        let keys = [
-            *b"aaaa", *b"aaab", *b"aaba", *b"abaa", *b"baaa", *b"aaaa", *b"zzzz",
-        ];
-        let set = external_set(4, &keys, 4);
-        assert_eq!(set.len(), 6);
-        for &key in &keys {
-            assert!(set.lookup(key));
-        }
-        assert!(!set.lookup(*b"aabb"));
-    }
-
-    #[test]
-    fn external_build_dedupes_shared_prefixes() {
-        // Keys sharing a 4-byte prefix collapse to one entry even when partitioning separates
-        // sorting into single-key buckets.
-        let keys = [*b"abcd1234", *b"abcd9999", *b"wxyz0000"];
-        let set = external_set(8, &keys, 4);
-        assert_eq!(set.len(), 2);
-        assert!(set.lookup(*b"abcdXXXX"));
-        assert!(set.lookup(*b"wxyz9999"));
-        assert!(!set.lookup(*b"abzz0000"));
-    }
-
-    #[test]
-    fn external_build_empty() {
-        let set = external_set::<4>(1024, &[], 4);
-        assert!(set.is_empty());
-        assert!(!set.lookup(*b"abcd"));
-    }
-
-    #[test]
-    fn external_build_roundtrips_through_file() {
-        let set = external_set(4, &[*b"abcd", *b"zzzz"], 4);
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("set.bin");
-        set.write(&path).expect("write data file");
-
-        let loaded = ByteStringSet::<4>::read(&path).expect("load data file");
-        assert_eq!(loaded.len(), 2);
-        assert!(loaded.lookup(*b"abcd"));
-        assert!(loaded.lookup(*b"zzzz"));
-        assert!(!loaded.lookup(*b"abce"));
-    }
-
-    #[test]
-    fn import_merges_file_into_builder() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("set.bin");
-        sample_set().write(&path).expect("write data file");
-
-        let mut builder = ByteStringSet::<4>::builder();
-        builder.insert(*b"wxyz").expect("insert key");
-        builder.import(&path).expect("import data file");
-        let set = builder.build().expect("valid build");
-        assert_eq!(set.len(), 5);
-        assert!(set.lookup(*b"wxyz"));
-        assert!(set.lookup(*b"abcd"));
-        assert!(set.lookup(*b"zzzz"));
-        assert!(!set.lookup(*b"abcf"));
-    }
-
-    #[test]
-    fn import_merges_file_into_external_builder() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("set.bin");
-        sample_set().write(&path).expect("write data file");
-
-        // A one-key bucket budget forces the imported keys through the partitioning path.
-        let mut builder = ByteStringSet::<4>::external_builder(4, 4).expect("create spill file");
-        builder.insert(*b"abcd").expect("spill key");
-        builder.insert(*b"wxyz").expect("spill key");
-        builder.import(&path).expect("import data file");
-        let set = builder.build().expect("valid build");
-        // "abcd" was inserted and imported; it must still collapse to one entry.
-        assert_eq!(set.len(), 5);
-        assert!(set.lookup(*b"wxyz"));
-        assert!(set.lookup(*b"abcd"));
-        assert!(set.lookup(*b"zzzz"));
-    }
-
-    /// Write a data file of 4-byte prefixes (from an 8-byte-key set) and return its path.
-    fn write_prefix_file(dir: &Path) -> std::path::PathBuf {
-        let mut builder = ByteStringSet::<8>::builder_with_prefix_len(4);
-        builder.insert(*b"abcd1234").expect("insert key");
-        let set = builder.build().expect("valid build");
-        let path = dir.join("prefixes.bin");
-        set.write(&path).expect("write data file");
-        path
-    }
-
-    #[test]
-    fn import_pads_shorter_prefixes() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = write_prefix_file(dir.path());
-
-        let mut builder = ByteStringSet::<8>::builder_with_prefix_len(4);
-        builder.import(&path).expect("import data file");
-        builder.insert(*b"wxyz5678").expect("insert key");
-        let set = builder.build().expect("valid build");
-        assert_eq!(set.len(), 2);
-        assert!(set.lookup(*b"abcdXXXX"));
-        assert!(set.lookup(*b"wxyz9999"));
-        assert!(!set.lookup(*b"aaaaXXXX"));
-    }
-
-    #[test]
-    fn import_pads_into_external_builder() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = write_prefix_file(dir.path());
-
-        // An 8-byte bucket budget forces the padded keys through the partitioning path.
-        let mut builder = ByteStringSet::<8>::external_builder(3, 8).expect("create spill file");
-        builder.import(&path).expect("import data file");
-        builder.insert(*b"wxyz5678").expect("spill key");
-        let set = builder.build().expect("valid build");
-        assert_eq!(set.len(), 2);
-        assert!(set.lookup(*b"abcXXXXX"));
-        assert!(set.lookup(*b"wxyXXXXX"));
-    }
-
-    #[test]
-    fn import_rejects_shorter_prefix_file() {
-        // The file stores 4-byte prefixes, which carry no information past byte 4, so a
-        // builder targeting longer prefixes must refuse them.
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = write_prefix_file(dir.path());
-
-        let mut builder = ByteStringSet::<8>::builder();
-        assert!(matches!(
-            builder.import(&path),
-            Err(Error::PrefixLenExceedsImport {
-                prefix_len: 8,
-                imported_prefix_len: 4
-            })
-        ));
-    }
-
-    #[test]
-    fn import_rejects_invalid_files() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("bad.bin");
-        let mut builder = ByteStringSet::<4>::builder();
-
-        std::fs::write(&path, b"junk").expect("write file");
-        assert!(matches!(builder.import(&path), Err(Error::BadHeader)));
-
-        std::fs::write(&path, raw_file(4, b"abcde")).expect("write file");
-        assert!(matches!(
-            builder.import(&path),
-            Err(Error::Misaligned {
-                data_len: 5,
-                prefix_len: 4
-            })
-        ));
-
-        std::fs::write(&path, raw_file(5, b"abcde")).expect("write file");
-        assert!(matches!(
-            builder.import(&path),
-            Err(Error::InvalidPrefixLen {
-                prefix_len: 5,
-                key_len: 4
-            })
-        ));
-
-        // The failed imports must not have contaminated the builder.
-        let set = builder.build().expect("valid build");
-        assert!(set.is_empty());
-    }
-
-    #[test]
-    fn file_roundtrip_preserves_membership() {
-        let set = sample_set();
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("set.bin");
-        set.write(&path).expect("write data file");
-
-        let loaded = ByteStringSet::<4>::read(&path).expect("load data file");
-        assert_eq!(loaded.prefix_len(), 4);
-        assert_eq!(loaded.len(), set.len());
-        assert!(loaded.lookup(*b"abcd"));
-        assert!(loaded.lookup(*b"zzzz"));
-        assert!(!loaded.lookup(*b"abcf"));
-    }
-
-    #[test]
-    fn read_rejects_misaligned_files() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("bad.bin");
-        std::fs::write(&path, raw_file(4, b"abcde")).expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::Misaligned {
-                data_len: 5,
-                prefix_len: 4
-            })
-        ));
-    }
-
-    #[test]
-    fn read_rejects_unsorted_files() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("unsorted.bin");
-        std::fs::write(&path, raw_file(4, b"zzzzaaaa")).expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::Unsorted { index: 1 })
-        ));
-    }
-
-    #[test]
-    fn read_rejects_missing_or_truncated_header() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("garbage.bin");
-        std::fs::write(&path, b"not a bsset file").expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::BadHeader)
-        ));
-
-        std::fs::write(&path, b"BSST").expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::BadHeader)
-        ));
-    }
-
-    #[test]
-    fn read_rejects_unsupported_version() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("future.bin");
-        let mut bytes = raw_file(4, b"abcd");
-        bytes[4] = 2;
-        std::fs::write(&path, bytes).expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::UnsupportedVersion { version: 2 })
-        ));
-    }
-
-    #[test]
-    fn read_rejects_prefix_exceeding_key_len() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("wide.bin");
-        std::fs::write(&path, raw_file(5, b"abcde")).expect("write file");
-        assert!(matches!(
-            ByteStringSet::<4>::read(&path),
-            Err(Error::InvalidPrefixLen {
-                prefix_len: 5,
-                key_len: 4
-            })
-        ));
-    }
-}
-
-#[cfg(test)]
-mod proptests {
-    use std::collections::BTreeSet;
-
-    use proptest::prelude::*;
-
-    use super::*;
-
-    const KEY_LEN: usize = 8;
-
-    /// Keys drawn from the full byte range or from a tiny alphabet; the latter forces shared
-    /// prefixes, duplicate keys, and crowded offset-table buckets, which uniform random bytes
-    /// almost never produce.
-    fn key_strategy() -> impl Strategy<Value = [u8; KEY_LEN]> {
-        prop_oneof![
-            proptest::array::uniform8(any::<u8>()),
-            proptest::array::uniform8(0u8..4),
-        ]
-    }
-
-    /// Reference model: the distinct `prefix_len`-byte prefixes of `keys`.
-    fn reference_prefixes(keys: &[[u8; KEY_LEN]], prefix_len: usize) -> BTreeSet<Vec<u8>> {
-        keys.iter().map(|key| key[..prefix_len].to_vec()).collect()
-    }
-
-    fn build_set(keys: &[[u8; KEY_LEN]], prefix_len: usize) -> ByteStringSet<KEY_LEN> {
-        let mut builder = ByteStringSet::<KEY_LEN>::builder_with_prefix_len(prefix_len);
-        for &key in keys {
-            builder.insert(key).expect("in-memory insert cannot fail");
-        }
-        builder.build().expect("prefix_len is within 3..=KEY_LEN")
-    }
-
-    proptest! {
-        // Each case allocates the 64 MiB offset table, so keep the case count moderate.
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        #[test]
-        fn lookup_matches_reference_model(
-            keys in proptest::collection::vec(key_strategy(), 0..64),
-            probes in proptest::collection::vec(key_strategy(), 0..64),
-            prefix_len in OFFSET_TABLE_PREFIX_LEN..=KEY_LEN,
-        ) {
-            let set = build_set(&keys, prefix_len);
-            let reference = reference_prefixes(&keys, prefix_len);
-            prop_assert_eq!(set.len(), reference.len());
-            // Inserted keys must all hit; probes must agree with the model either way.
-            for &probe in keys.iter().chain(&probes) {
-                prop_assert_eq!(set.lookup(probe), reference.contains(&probe[..prefix_len]));
-            }
-        }
-
-        #[test]
-        fn file_roundtrip_preserves_lookups(
-            keys in proptest::collection::vec(key_strategy(), 0..64),
-            probes in proptest::collection::vec(key_strategy(), 0..64),
-            prefix_len in OFFSET_TABLE_PREFIX_LEN..=KEY_LEN,
-        ) {
-            let set = build_set(&keys, prefix_len);
-            let dir = tempfile::tempdir().expect("create temp dir");
-            let path = dir.path().join("set.bin");
-            set.write(&path).expect("write data file");
-
-            let loaded = ByteStringSet::<KEY_LEN>::read(&path).expect("load data file");
-            prop_assert_eq!(loaded.prefix_len(), prefix_len);
-            prop_assert_eq!(loaded.len(), set.len());
-            for &probe in keys.iter().chain(&probes) {
-                prop_assert_eq!(loaded.lookup(probe), set.lookup(probe));
-            }
-        }
-
-        #[test]
-        fn import_matches_direct_inserts(
-            file_keys in proptest::collection::vec(key_strategy(), 0..64),
-            extra_keys in proptest::collection::vec(key_strategy(), 0..64),
-            // The imported file's prefix length must be at least the builder's, so draw the
-            // pair with `prop_flat_map`: first the file's, then the builder's within it.
-            (file_prefix_len, prefix_len) in (OFFSET_TABLE_PREFIX_LEN..=KEY_LEN)
-                .prop_flat_map(|file| (Just(file), OFFSET_TABLE_PREFIX_LEN..=file)),
-        ) {
-            // Write a set of `file_prefix_len`-byte prefixes, import it alongside loose keys,
-            // and compare with building from the concatenated key list directly; truncating an
-            // imported prefix is the same as truncating the original key.
-            let dir = tempfile::tempdir().expect("create temp dir");
-            let path = dir.path().join("set.bin");
-            build_set(&file_keys, file_prefix_len).write(&path).expect("write data file");
-
-            let mut builder = ByteStringSet::<KEY_LEN>::builder_with_prefix_len(prefix_len);
-            builder.import(&path).expect("import data file");
-            for &key in &extra_keys {
-                builder.insert(key).expect("insert key");
-            }
-            let merged = builder.build().expect("valid build");
-
-            let all: Vec<_> = file_keys.iter().chain(&extra_keys).copied().collect();
-            let direct = build_set(&all, prefix_len);
-            prop_assert_eq!(merged.len(), direct.len());
-            for &probe in &all {
-                prop_assert!(merged.lookup(probe));
-            }
-        }
-
-        #[test]
-        fn external_build_matches_in_memory(
-            keys in proptest::collection::vec(key_strategy(), 0..64),
-            probes in proptest::collection::vec(key_strategy(), 0..64),
-            prefix_len in OFFSET_TABLE_PREFIX_LEN..=KEY_LEN,
-            // Small budgets force deep recursive partitioning; the unit tests cover the
-            // single-bucket case.
-            max_bucket_bytes in 0usize..=128,
-        ) {
-            let in_memory = build_set(&keys, prefix_len);
-            let mut builder =
-                ByteStringSet::<KEY_LEN>::external_builder(prefix_len, max_bucket_bytes)
-                    .expect("create spill file");
-            for &key in &keys {
-                builder.insert(key).expect("spill key");
-            }
-            let external = builder.build().expect("valid build");
-            prop_assert_eq!(external.len(), in_memory.len());
-            for &probe in keys.iter().chain(&probes) {
-                prop_assert_eq!(external.lookup(probe), in_memory.lookup(probe));
-            }
-        }
-    }
-}
+mod tests;
